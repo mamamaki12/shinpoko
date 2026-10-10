@@ -249,6 +249,79 @@ export const TEMPLATES = [
       ctx.restore();
     },
   },
+
+  // ───── 動くオーバーレイ(カメラ・動画では動き、写真では保存時の一瞬が焼き付く) ─────
+  {
+    id: 'fall-hearts', name: 'ハート降る', animated: true,
+    draw(ctx, w, h, t = 0.4) {
+      const u = unit(w, h), r = rng(5);
+      ctx.save();
+      for (let i = 0; i < 28; i++) {
+        const sp = 0.05 + r() * 0.09, x0 = r() * w, ph = r(), sz = (2 + r() * 3.4) * u;
+        const y = ((ph + t * sp) % 1) * (h + 10 * u) - 5 * u;
+        const x = x0 + Math.sin(t * 1.4 + i) * 2.4 * u;
+        ctx.globalAlpha = 0.65 + r() * 0.35;
+        ctx.fillStyle = PASTEL[i % 3];
+        ctx.shadowColor = '#fff'; ctx.shadowBlur = sz * 0.5;
+        heartPath(ctx, x, y, sz); ctx.fill();
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 0.35 * u; ctx.stroke();
+      }
+      ctx.restore();
+    },
+  },
+  {
+    id: 'twinkle', name: 'キラキラ舞う', animated: true,
+    draw(ctx, w, h, t = 0.4) {
+      const u = unit(w, h), r = rng(11);
+      ctx.save();
+      const cols = ['#ffffff', '#fff3b0', '#ffd0e6', '#d6ecff'];
+      for (let i = 0; i < 42; i++) {
+        const x = r() * w, y = r() * h, sz = (1 + r() * 3.2) * u, ph = r() * 6.28, sp = 1.5 + r() * 3;
+        const a = Math.max(0, Math.sin(t * sp + ph));
+        if (a < 0.05) continue;
+        ctx.globalAlpha = a;
+        ctx.shadowColor = '#fff'; ctx.shadowBlur = sz * 2;
+        ctx.fillStyle = cols[i % cols.length];
+        sparklePath(ctx, x, y, sz * (0.5 + a * 0.8)); ctx.fill();
+      }
+      ctx.restore();
+    },
+  },
+  {
+    id: 'snow', name: 'ゆき', animated: true,
+    draw(ctx, w, h, t = 0.4) {
+      const u = unit(w, h), r = rng(3);
+      ctx.save();
+      ctx.fillStyle = '#fff';
+      for (let i = 0; i < 80; i++) {
+        const sp = 0.06 + r() * 0.1, x0 = r() * w, ph = r(), sz = (0.4 + r() * 1.1) * u;
+        const y = ((ph + t * sp) % 1) * (h + 4 * u) - 2 * u;
+        const x = x0 + Math.sin(t * 0.9 + i) * 2 * u;
+        ctx.globalAlpha = 0.5 + r() * 0.5;
+        ctx.shadowColor = '#fff'; ctx.shadowBlur = sz * 2;
+        ctx.beginPath(); ctx.arc(x, y, sz, 0, 7); ctx.fill();
+      }
+      ctx.restore();
+    },
+  },
+  {
+    id: 'bubbles', name: 'ふわふわ泡', animated: true,
+    draw(ctx, w, h, t = 0.4) {
+      const u = unit(w, h), r = rng(9);
+      ctx.save();
+      for (let i = 0; i < 16; i++) {
+        const sp = 0.04 + r() * 0.07, x0 = r() * w, ph = r(), sz = (2 + r() * 5) * u;
+        const y = h + sz - ((ph + t * sp) % 1) * (h + 2 * sz);
+        const x = x0 + Math.sin(t + i * 2) * 3 * u;
+        const g = ctx.createRadialGradient(x - sz * 0.3, y - sz * 0.3, sz * 0.1, x, y, sz);
+        g.addColorStop(0, 'rgba(255,255,255,.55)'); g.addColorStop(0.7, 'rgba(200,225,255,.12)'); g.addColorStop(1, 'rgba(255,200,240,.35)');
+        ctx.fillStyle = g;
+        ctx.beginPath(); ctx.arc(x, y, sz, 0, 7); ctx.fill();
+        ctx.strokeStyle = 'rgba(255,255,255,.6)'; ctx.lineWidth = 0.25 * u; ctx.stroke();
+      }
+      ctx.restore();
+    },
+  },
 ];
 
 // 一覧用サムネイル

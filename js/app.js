@@ -1,5 +1,6 @@
 import { FILTERS, applyAdjust } from './filters.js';
 import { TEMPLATES, drawTemplateThumb, heartPath, sparklePath } from './templates.js';
+import { POST_EFFECTS, PostFx } from './post.js';
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -22,14 +23,15 @@ const FONT = '"Hiragino Maru Gothic ProN","Hiragino Sans","Yu Gothic","Noto Sans
 const state = {
   mode: 'photo', tool: 'filter',
   W: 0, H: 0, kind: null, source: null, mirror: false, facing: 'user',
-  filter: FILTERS[0], adj: { brightness: 0, contrast: 0, saturation: 0 },
+  filter: FILTERS[0], adj: { brightness: 0, contrast: 0, saturation: 0, warmth: 0, sharpness: 0, vignette: 0 },
+  effect: POST_EFFECTS[0], effectAmt: 1,
   template: TEMPLATES[0],
   mosaic: { shape: 'brush', style: 'pixel', mode: 'paint', block: 20, brush: 50, any: false },
   draw: { tool: 'pen', penType: 'normal', stamp: '♡', textStyle: 'pop', color: COLORS[0], size: 14 },
   dirty: true, exporting: false, snapshotJustTaken: false,
 };
 
-let glc = null, tex = null, glFailed = false;
+let glc = null, tex = null, glFailed = false, post = null;
 
 // ───────── ユーティリティ ─────────
 function toast(msg, ms = 2400) {
@@ -59,7 +61,7 @@ function setSize(w, h, keepLayers) {
   if (changed) for (const c of [srcC, out, tmpC]) { c.width = w; c.height = h; }
   if (changed || !keepLayers) {
     for (const c of [maskC, drawC]) { c.width = w; c.height = h; }
-    state.mosaic.any = false; undoStack.length = 0;
+    state.mosaic.any = false; undoStack.length = 0; refreshUndo();
   }
 }
 
@@ -69,6 +71,7 @@ function setSource(kind, source, w, h, keepLayers = false) {
   $('#empty').classList.add('hide'); out.classList.add('show');
   if (kind === 'image') drawSource();
   state.dirty = true;
+  if (kind === 'image') buildThumbs(); else setTimeout(buildThumbs, 400);
 }
 
 function drawSource() {
@@ -93,7 +96,8 @@ function fit(w, h, max) {
 function ensureGL() {
   if (glc || glFailed) return;
   try { glc = fx.canvas(); tex = glc.texture(srcC); }
-  catch (e) { glFailed = true; toast('WebGL が使えないため加工フィルターは無効です'); }
+  catch (e) { glFailed = true; toast('WebGL が使えないため加工フィルターは無効です'); return; }
+  try { post = new PostFx(); } catch (e) { console.warn('post effects disabled', e); }
 }
 
 function render() {
@@ -102,18 +106,20 @@ function render() {
   if (state.kind !== 'image') drawSource();
   ensureGL();
   let base = srcC;
+  const t = performance.now() / 1000;
   if (glc) {
     tex.loadContentsOf(srcC);
     glc.draw(tex);
     state.filter.apply(glc, W, H);
-    applyAdjust(glc, state.adj);
+    applyAdjust(glc, state.adj, W, H);
     glc.update();
     base = glc;
   }
+  if (post && state.effect.mode) base = post.render(base, W, H, state.effect.mode, t, state.effectAmt);
   octx.drawImage(base, 0, 0, W, H);
   if (state.mosaic.any) applyMosaic();
   octx.drawImage(drawC, 0, 0);
-  state.template.draw(octx, W, H);
+  state.template.draw(octx, W, H, t);
 }
 
 function applyMosaic() {
@@ -133,7 +139,9 @@ function applyMosaic() {
   octx.drawImage(tmpC, 0, 0);
 }
 
+const STATIC_FX = new Set(['none', 'rgb', 'mirror', 'duo', 'bloom']);
 function isLive() {
+  if (state.template.animated || !STATIC_FX.has(state.effect.id)) return true;
   if (state.kind === 'camera') return camVideo.readyState >= 2;
   if (state.kind === 'video') return !fileVideo.paused && !fileVideo.ended;
   return false;
@@ -196,7 +204,7 @@ function shutter() {
   state.snapshotJustTaken = true;
   stopCamera();
   state.mirror = false; // 既にミラー済みの画像なので二重反転しない
-  setMode('photo', true);
+  enterMode('photo');
   setSource('image', snap, state.W, state.H, true);
   toast('撮影しました。加工して保存できます');
 }
@@ -300,7 +308,7 @@ function videoAudioTracks() {
 async function exportVideo() {
   if (state.kind !== 'video' || state.exporting) return toast('先に動画を選んでください');
   state.exporting = true;
-  const btn = $('#exportBtn'), bar = $('#progress i');
+  const btn = $('#doneBtn'), bar = $('#progress i');
   btn.disabled = true; btn.textContent = '書き出し中…';
   fileVideo.pause(); fileVideo.loop = false;
   const tracks = videoAudioTracks();
@@ -323,30 +331,63 @@ async function exportVideo() {
   showResult(blob);
 }
 
-// ───────── モード切替 ─────────
-const EMPTY = {
-  photo: ['写真を選んで編集をはじめよう', '写真を選ぶ'],
-  camera: ['カメラを起動します', 'カメラを開く'],
-  video: ['動画を選んで加工しよう', '動画を選ぶ'],
+// ───────── 画面遷移 ─────────
+const MODE_UI = {
+  photo: { title: '写真', done: '保存', empty: ['写真を選んでください', '写真を選ぶ'] },
+  camera: { title: 'カメラ', done: null, empty: ['カメラを起動しています…', 'カメラを開く'] },
+  video: { title: '動画', done: '書き出し', empty: ['動画を選んでください', '動画を選ぶ'] },
 };
 
 function hasEdits() { return undoStack.length > 0 || state.mosaic.any; }
+function refreshUndo() { $('#undoBtn').disabled = undoStack.length === 0; }
 
-function setMode(m, force = false) {
-  if (m === state.mode && !force) return;
-  if (!force && state.source && state.kind !== 'camera' && hasEdits() && !confirm('編集中の内容は破棄されます。切り替えますか?')) return;
+function enterMode(m) {
   if (state.exporting) return toast('書き出し中は切り替えできません');
   if (camRec) camRec.rec.stop();
   stopCamera(); fileVideo.pause();
-  const prevKind = state.kind;
   state.mode = m;
-  $$('#modes button').forEach((b) => b.classList.toggle('on', b.dataset.mode === m));
-  $$('.bar').forEach((b) => b.classList.toggle('on', b.dataset.for === m));
-  if (!force && prevKind !== null) clearSource();
+  document.body.dataset.view = 'edit'; document.body.dataset.mode = m;
+  const ui = MODE_UI[m], d = $('#doneBtn');
+  $('#title').textContent = ui.title;
+  d.hidden = !ui.done; if (ui.done) d.textContent = ui.done;
+  $('#emptyText').textContent = ui.empty[0]; $('#emptyBtn').textContent = ui.empty[1];
   if (m === 'camera') startCamera();
-  const [t, b] = EMPTY[m];
-  $('#emptyText').textContent = t; $('#emptyBtn').textContent = b;
-  if (m === 'camera' && !state.source) $('#empty').classList.remove('hide');
+}
+
+function goHome() {
+  if (state.exporting) return toast('書き出し中は戻れません');
+  if (state.source && hasEdits() && !confirm('編集中の内容は破棄されます。ホームに戻りますか?')) return;
+  if (camRec) camRec.rec.stop();
+  stopCamera(); fileVideo.pause(); clearSource();
+  state.W = state.H = 0; undoStack.length = 0; state.mosaic.any = false; refreshUndo();
+  document.body.dataset.view = 'home';
+}
+
+// ───────── サムネイル(実際の素材にフィルター/エフェクト/フレームを当てたプレビュー) ─────────
+const TW = 240, TH = 300;
+const thumbEls = { filter: [], effect: [], template: [] };
+let thumbGL = null, thumbTex = null, thumbPost = null, thumbSrc = null;
+
+function buildThumbs() {
+  if (!state.source || !state.W) return;
+  if (state.kind !== 'image') drawSource();
+  thumbSrc ||= mk(); thumbSrc.width = TW; thumbSrc.height = TH;
+  const c = thumbSrc.getContext('2d');
+  const sc = Math.max(TW / state.W, TH / state.H), dw = state.W * sc, dh = state.H * sc;
+  c.drawImage(srcC, (TW - dw) / 2, (TH - dh) / 2, dw, dh);
+  const put = (cv, img) => cv.getContext('2d').drawImage(img, 0, 0, TW, TH);
+  try {
+    thumbGL ||= fx.canvas();
+    thumbTex = thumbTex ? (thumbTex.loadContentsOf(thumbSrc), thumbTex) : thumbGL.texture(thumbSrc);
+    for (const { cv, it } of thumbEls.filter) {
+      thumbGL.draw(thumbTex); it.apply(thumbGL, TW, TH, 3); thumbGL.update(); put(cv, thumbGL);
+    }
+  } catch (e) { for (const { cv } of thumbEls.filter) put(cv, thumbSrc); }
+  try {
+    thumbPost ||= new PostFx();
+    for (const { cv, it } of thumbEls.effect) put(cv, thumbPost.render(thumbSrc, TW, TH, it.mode, 0.6, 1));
+  } catch (e) { for (const { cv } of thumbEls.effect) put(cv, thumbSrc); }
+  for (const { cv, it } of thumbEls.template) { put(cv, thumbSrc); it.draw(cv.getContext('2d'), TW, TH, 0.6); }
 }
 
 // ───────── モザイク操作 ─────────
@@ -356,9 +397,11 @@ function pushUndo(layer) {
   c.getContext('2d').drawImage(src, 0, 0);
   undoStack.push({ layer, c });
   if (undoStack.length > 12) undoStack.shift();
+  refreshUndo();
 }
 function undo() {
   const e = undoStack.pop();
+  refreshUndo();
   if (!e) return toast('戻す操作がありません');
   const ctx = e.layer === 'mosaic' ? mctx : dctx;
   ctx.clearRect(0, 0, state.W, state.H); ctx.drawImage(e.c, 0, 0);
@@ -534,27 +577,50 @@ function chips(el, items, get, set) {
   });
 }
 
+function thumbList(el, key, items, isOn, onPick, placeholder) {
+  items.forEach((it) => {
+    const b = document.createElement('button');
+    const cv = mk(); cv.width = TW; cv.height = TH;
+    if (placeholder) placeholder(cv, it); else { const g = cv.getContext('2d'); g.fillStyle = '#3a3a3c'; g.fillRect(0, 0, TW, TH); }
+    thumbEls[key].push({ cv, it });
+    b.append(cv, it.name);
+    if (isOn(it)) b.classList.add('on');
+    b.addEventListener('click', () => {
+      onPick(it); $$('button', el).forEach((x) => x.classList.toggle('on', x === b)); state.dirty = true;
+    });
+    el.appendChild(b);
+  });
+}
+
 function buildUI() {
-  // モード
-  $$('#modes button').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
+  // 画面遷移
+  $$('[data-start]').forEach((b) => b.addEventListener('click', () => {
+    const m = b.dataset.start;
+    enterMode(m);
+    if (m === 'photo') $('#photoInput').click();
+    else if (m === 'video') $('#videoInput').click();
+  }));
+  $('#closeBtn').addEventListener('click', goHome);
+  $('#undoBtn').addEventListener('click', undo);
+  $('#doneBtn').addEventListener('click', () => (state.mode === 'photo' ? savePhoto() : exportVideo()));
   $$('#tools button').forEach((b) => b.addEventListener('click', () => setTool(b.dataset.tool)));
 
-  // 加工
-  chips($('#filterChips'), FILTERS.map((f) => ({ f, label: f.name })), (i) => i.f === state.filter, (i) => { state.filter = i.f; });
-  for (const [id, key] of [['adjBrightness', 'brightness'], ['adjContrast', 'contrast'], ['adjSaturation', 'saturation']]) {
-    $(`#${id}`).addEventListener('input', (e) => { state.adj[key] = e.target.value / 100; state.dirty = true; });
-  }
+  // フィルター / エフェクト / フレーム(サムネイル付き)
+  thumbList($('#filterChips'), 'filter', FILTERS, (f) => f === state.filter, (f) => { state.filter = f; });
+  thumbList($('#effectChips'), 'effect', POST_EFFECTS, (f) => f === state.effect, (f) => { state.effect = f; });
+  thumbList($('#templateGrid'), 'template', TEMPLATES, (t) => t === state.template, (t) => { state.template = t; }, (cv, t) => drawTemplateThumb(cv, t));
+  $('#effectAmt').addEventListener('input', (e) => { state.effectAmt = e.target.value / 100; state.dirty = true; });
 
-  // テンプレート
-  TEMPLATES.forEach((t) => {
-    const b = document.createElement('button');
-    const c = mk(); c.width = 128; c.height = 160;
-    drawTemplateThumb(c, t);
-    b.append(c, t.name);
-    if (t === state.template) b.classList.add('on');
-    b.addEventListener('click', () => { state.template = t; $$('#templateGrid button').forEach((x) => x.classList.toggle('on', x === b)); state.dirty = true; });
-    $('#templateGrid').appendChild(b);
+  // 調整
+  $$('[data-adj]').forEach((inp) => inp.addEventListener('input', () => { state.adj[inp.dataset.adj] = inp.value / 100; state.dirty = true; }));
+  $('#adjReset').addEventListener('click', () => {
+    $$('[data-adj]').forEach((inp) => { inp.value = 0; state.adj[inp.dataset.adj] = 0; inp.parentElement.querySelector('output').textContent = '0'; });
+    state.dirty = true;
   });
+  // スライダーの数値表示
+  $$('.slider input').forEach((i) => i.addEventListener('input', () => {
+    const o = i.parentElement.querySelector('output'); if (o) o.textContent = i.value;
+  }));
 
   // モザイク
   seg('mosaicShape', 'shape', state.mosaic);
@@ -595,7 +661,6 @@ function buildUI() {
     $('#colors').appendChild(b);
   });
   $('#penSize').addEventListener('input', (e) => { state.draw.size = +e.target.value; });
-  $('#drawUndo').addEventListener('click', undo);
   $('#drawClear').addEventListener('click', () => {
     if (!state.source) return;
     pushUndo('draw'); dctx.clearRect(0, 0, state.W, state.H); state.dirty = true;
@@ -603,9 +668,7 @@ function buildUI() {
   showSub();
 
   // 写真
-  $('#openPhoto').addEventListener('click', () => $('#photoInput').click());
   $('#photoInput').addEventListener('change', (e) => { loadPhoto(e.target.files[0]); e.target.value = ''; });
-  $('#savePhoto').addEventListener('click', savePhoto);
 
   // カメラ
   $('#flipCam').addEventListener('click', () => { state.facing = state.facing === 'user' ? 'environment' : 'user'; startCamera(); });
@@ -613,11 +676,12 @@ function buildUI() {
   $('#recBtn').addEventListener('click', toggleCamRec);
 
   // 動画
-  $('#openVideo').addEventListener('click', () => $('#videoInput').click());
   $('#videoInput').addEventListener('change', (e) => { loadVideo(e.target.files[0]); e.target.value = ''; });
   $('#playBtn').addEventListener('click', () => { if (fileVideo.paused) fileVideo.play(); else fileVideo.pause(); syncPlayBtn(); state.dirty = true; });
   $('#muteBtn').addEventListener('click', () => { fileVideo.muted = !fileVideo.muted; $('#muteBtn').textContent = fileVideo.muted ? '🔇' : '🔊'; });
-  $('#exportBtn').addEventListener('click', exportVideo);
+  $('#seek').addEventListener('input', (e) => { if (fileVideo.duration) { fileVideo.currentTime = e.target.value / 1000 * fileVideo.duration; state.dirty = true; } });
+  fileVideo.addEventListener('timeupdate', () => { if (fileVideo.duration && !state.exporting) $('#seek').value = fileVideo.currentTime / fileVideo.duration * 1000; });
+  fileVideo.addEventListener('seeked', () => { state.dirty = true; });
 
   // 空状態ボタン
   $('#emptyBtn').addEventListener('click', () => {
@@ -632,9 +696,8 @@ function buildUI() {
 }
 
 buildUI();
-setMode('photo', true);
 setTool('filter');
 loop();
 
 // テスト用フック
-window.__shinpoko = { state, render, loadPhoto, setMode, setTool, undoStack };
+window.__shinpoko = { state, render, loadPhoto, enterMode, goHome, setTool, undoStack };
