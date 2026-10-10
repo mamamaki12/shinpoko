@@ -18,10 +18,10 @@
 
 ## 公開(GitHub Pages)
 
-`.github/workflows/pages.yml` が `main`(または `master`)への push で自動デプロイします。
+`.github/workflows/pages.yml` が `main` / `master` / `claude/photo-video-editor` への push で自動デプロイします。
 
 1. リポジトリの **Settings → Pages → Build and deployment → Source** を **GitHub Actions** にする
-2. このブランチを `main` にマージする(または Actions タブから手動実行)
+2. push すると自動で公開される(Actions タブから手動実行も可)。`main` を作った場合は `main` への push でも公開
 3. 公開URL: `https://<ユーザー名>.github.io/shinpoko/`(https なのでスマホのカメラも使えます)
 
 ## ローカルで動かす
