@@ -1,0 +1,640 @@
+import { FILTERS, applyAdjust } from './filters.js';
+import { TEMPLATES, drawTemplateThumb, heartPath, sparklePath } from './templates.js';
+
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const mk = () => document.createElement('canvas');
+
+// ───────── キャンバス構成 ─────────
+// srcC: 元素材(ミラー込み) → glfx(加工) → out: [モザイク] → 書き込み → テンプレート
+const out = $('#out');
+const octx = out.getContext('2d');
+const srcC = mk(), maskC = mk(), drawC = mk(), tmpC = mk(), smallC = mk();
+const sctx = srcC.getContext('2d'), mctx = maskC.getContext('2d'), dctx = drawC.getContext('2d');
+const tctx = tmpC.getContext('2d'), smctx = smallC.getContext('2d');
+const camVideo = $('#camVideo'), fileVideo = $('#fileVideo');
+
+const MAX_PHOTO = 1920, MAX_VIDEO = 1280;
+const COLORS = ['#ff4fa3', '#ff9ac7', '#ffffff', '#ffe14d', '#7be0ff', '#a98bff', '#6ee7a8', '#222222'];
+const SPARKLE_COLORS = ['#ffffff', '#fff3b0', '#ffd0e6', '#d6ecff', '#e3d4ff'];
+const FONT = '"Hiragino Maru Gothic ProN","Hiragino Sans","Yu Gothic","Noto Sans JP",system-ui,sans-serif';
+
+const state = {
+  mode: 'photo', tool: 'filter',
+  W: 0, H: 0, kind: null, source: null, mirror: false, facing: 'user',
+  filter: FILTERS[0], adj: { brightness: 0, contrast: 0, saturation: 0 },
+  template: TEMPLATES[0],
+  mosaic: { shape: 'brush', style: 'pixel', mode: 'paint', block: 20, brush: 50, any: false },
+  draw: { tool: 'pen', penType: 'normal', stamp: '♡', textStyle: 'pop', color: COLORS[0], size: 14 },
+  dirty: true, exporting: false, snapshotJustTaken: false,
+};
+
+let glc = null, tex = null, glFailed = false;
+
+// ───────── ユーティリティ ─────────
+function toast(msg, ms = 2400) {
+  const t = $('#toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove('show'), ms);
+}
+const stamp = () => new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+
+async function saveBlob(blob, name) {
+  const file = new File([blob], name, { type: blob.type });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try { await navigator.share({ files: [file] }); return; } catch (e) { if (e.name === 'AbortError') return; }
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+
+// ───────── ソース/サイズ ─────────
+const undoStack = [];
+
+function setSize(w, h, keepLayers) {
+  const changed = w !== state.W || h !== state.H;
+  state.W = w; state.H = h;
+  if (changed) for (const c of [srcC, out, tmpC]) { c.width = w; c.height = h; }
+  if (changed || !keepLayers) {
+    for (const c of [maskC, drawC]) { c.width = w; c.height = h; }
+    state.mosaic.any = false; undoStack.length = 0;
+  }
+}
+
+function setSource(kind, source, w, h, keepLayers = false) {
+  state.kind = kind; state.source = source;
+  setSize(w, h, keepLayers);
+  $('#empty').classList.add('hide'); out.classList.add('show');
+  if (kind === 'image') drawSource();
+  state.dirty = true;
+}
+
+function drawSource() {
+  const { W, H, source, mirror } = state;
+  sctx.save();
+  if (mirror) { sctx.translate(W, 0); sctx.scale(-1, 1); }
+  sctx.drawImage(source, 0, 0, W, H);
+  sctx.restore();
+}
+
+function clearSource() {
+  state.kind = null; state.source = null;
+  out.classList.remove('show'); $('#empty').classList.remove('hide');
+}
+
+function fit(w, h, max) {
+  const s = Math.min(1, max / Math.max(w, h));
+  return [Math.round(w * s), Math.round(h * s)];
+}
+
+// ───────── 描画パイプライン ─────────
+function ensureGL() {
+  if (glc || glFailed) return;
+  try { glc = fx.canvas(); tex = glc.texture(srcC); }
+  catch (e) { glFailed = true; toast('WebGL が使えないため加工フィルターは無効です'); }
+}
+
+function render() {
+  if (!state.source) return;
+  const { W, H } = state;
+  if (state.kind !== 'image') drawSource();
+  ensureGL();
+  let base = srcC;
+  if (glc) {
+    tex.loadContentsOf(srcC);
+    glc.draw(tex);
+    state.filter.apply(glc, W, H);
+    applyAdjust(glc, state.adj);
+    glc.update();
+    base = glc;
+  }
+  octx.drawImage(base, 0, 0, W, H);
+  if (state.mosaic.any) applyMosaic();
+  octx.drawImage(drawC, 0, 0);
+  state.template.draw(octx, W, H);
+}
+
+function applyMosaic() {
+  const { W, H } = state;
+  const b = Math.max(2, Math.round(state.mosaic.block * W / 1000));
+  const sw = Math.ceil(W / b), sh = Math.ceil(H / b);
+  if (smallC.width !== sw || smallC.height !== sh) { smallC.width = sw; smallC.height = sh; }
+  smctx.imageSmoothingEnabled = true;
+  smctx.drawImage(out, 0, 0, sw, sh);
+  tctx.clearRect(0, 0, W, H);
+  tctx.imageSmoothingEnabled = state.mosaic.style === 'blur';
+  tctx.imageSmoothingQuality = 'high';
+  tctx.drawImage(smallC, 0, 0, sw * b, sh * b);
+  tctx.globalCompositeOperation = 'destination-in';
+  tctx.drawImage(maskC, 0, 0);
+  tctx.globalCompositeOperation = 'source-over';
+  octx.drawImage(tmpC, 0, 0);
+}
+
+function isLive() {
+  if (state.kind === 'camera') return camVideo.readyState >= 2;
+  if (state.kind === 'video') return !fileVideo.paused && !fileVideo.ended;
+  return false;
+}
+function loop() {
+  requestAnimationFrame(loop);
+  if (state.source && (state.dirty || isLive())) { state.dirty = false; render(); }
+}
+
+// ───────── 写真 ─────────
+async function loadPhoto(file) {
+  if (!file) return;
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+  img.src = url;
+  try { await img.decode(); } catch { toast('画像を読み込めませんでした'); URL.revokeObjectURL(url); return; }
+  state.mirror = false;
+  const [w, h] = fit(img.naturalWidth, img.naturalHeight, MAX_PHOTO);
+  setSource('image', img, w, h);
+  URL.revokeObjectURL(url);
+}
+
+async function savePhoto() {
+  if (state.kind !== 'image') return toast('先に写真を選んでください');
+  render();
+  const blob = await new Promise((r) => out.toBlob(r, 'image/jpeg', 0.92));
+  await saveBlob(blob, `shinpoko-${stamp()}.jpg`);
+}
+
+// ───────── カメラ ─────────
+let camStream = null;
+
+async function startCamera() {
+  stopCamera();
+  if (!navigator.mediaDevices?.getUserMedia) return toast('このブラウザではカメラを使えません(https が必要です)');
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: state.facing, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false,
+    });
+  } catch (e) { return toast('カメラを使えませんでした: ' + (e.message || e.name), 4000); }
+  camVideo.srcObject = camStream;
+  await camVideo.play().catch(() => {});
+  if (!camVideo.videoWidth) await new Promise((r) => camVideo.addEventListener('loadedmetadata', r, { once: true }));
+  state.mirror = state.facing === 'user';
+  const [w, h] = fit(camVideo.videoWidth, camVideo.videoHeight, MAX_VIDEO);
+  setSource('camera', camVideo, w, h, true);
+}
+
+function stopCamera() {
+  camStream?.getTracks().forEach((t) => t.stop());
+  camStream = null; camVideo.srcObject = null;
+}
+
+function shutter() {
+  if (state.kind !== 'camera') return;
+  drawSource();
+  // 撮った一枚(加工前)を写真モードに引き継ぐ。書き込み/モザイクはそのまま残す
+  const snap = mk(); snap.width = state.W; snap.height = state.H;
+  snap.getContext('2d').drawImage(srcC, 0, 0);
+  state.snapshotJustTaken = true;
+  stopCamera();
+  state.mirror = false; // 既にミラー済みの画像なので二重反転しない
+  setMode('photo', true);
+  setSource('image', snap, state.W, state.H, true);
+  toast('撮影しました。加工して保存できます');
+}
+
+// ───────── 録画 ─────────
+function pickMime() {
+  const c = ['video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+  return c.find((m) => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
+}
+
+function startRecorder(audioTracks = []) {
+  if (!window.MediaRecorder) { toast('このブラウザは録画に対応していません'); return null; }
+  const stream = out.captureStream(30);
+  audioTracks.forEach((t) => stream.addTrack(t));
+  const mime = pickMime();
+  const rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 8e6 } : undefined);
+  const chunks = [];
+  rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+  const done = new Promise((res) => {
+    rec.onstop = () => res(new Blob(chunks, { type: rec.mimeType || mime || 'video/webm' }));
+  });
+  rec.start(250);
+  return { rec, done };
+}
+
+let resultBlob = null, resultName = '';
+function showResult(blob) {
+  resultBlob = blob;
+  resultName = `shinpoko-${stamp()}.${blob.type.includes('mp4') ? 'mp4' : 'webm'}`;
+  const v = $('#resultVideo');
+  v.src = URL.createObjectURL(blob);
+  $('#result').hidden = false;
+  v.play().catch(() => {});
+}
+function closeResult() {
+  const v = $('#resultVideo');
+  v.pause(); URL.revokeObjectURL(v.src); v.removeAttribute('src'); v.load();
+  $('#result').hidden = true;
+}
+
+// カメラ録画
+let camRec = null, camRecTimer = null, camAudio = null;
+async function toggleCamRec() {
+  const btn = $('#recBtn');
+  if (camRec) { camRec.rec.stop(); return; }
+  if (state.kind !== 'camera') return;
+  let tracks = [];
+  try {
+    camAudio = await navigator.mediaDevices.getUserMedia({ audio: true });
+    tracks = camAudio.getAudioTracks();
+  } catch { toast('マイクなしで録画します'); }
+  camRec = startRecorder(tracks);
+  if (!camRec) return;
+  const t0 = Date.now();
+  btn.classList.add('recording');
+  camRecTimer = setInterval(() => { btn.textContent = `■ ${Math.floor((Date.now() - t0) / 1000)}秒`; }, 250);
+  btn.textContent = '■ 0秒';
+  camRec.done.then((blob) => {
+    clearInterval(camRecTimer); camRec = null;
+    camAudio?.getTracks().forEach((t) => t.stop()); camAudio = null;
+    btn.classList.remove('recording'); btn.textContent = '● 録画';
+    showResult(blob);
+  });
+}
+
+// ───────── 動画の加工 ─────────
+let videoUrl = null, actx = null, vAudioDest = null, vAudioSrc = null;
+
+async function loadVideo(file) {
+  if (!file) return;
+  if (videoUrl) URL.revokeObjectURL(videoUrl);
+  videoUrl = URL.createObjectURL(file);
+  fileVideo.src = videoUrl; fileVideo.loop = true;
+  await new Promise((res, rej) => {
+    fileVideo.addEventListener('loadedmetadata', res, { once: true });
+    fileVideo.addEventListener('error', () => rej(new Error('load')), { once: true });
+  }).catch(() => toast('動画を読み込めませんでした'));
+  if (!fileVideo.videoWidth) return;
+  state.mirror = false;
+  const [w, h] = fit(fileVideo.videoWidth, fileVideo.videoHeight, MAX_VIDEO);
+  setSource('video', fileVideo, w, h);
+  try { await fileVideo.play(); } catch { fileVideo.muted = true; $('#muteBtn').textContent = '🔇'; await fileVideo.play().catch(() => {}); }
+  syncPlayBtn();
+}
+
+function syncPlayBtn() { $('#playBtn').textContent = fileVideo.paused ? '▶' : '⏸'; }
+
+function videoAudioTracks() {
+  try {
+    actx ||= new (window.AudioContext || window.webkitAudioContext)();
+    if (!vAudioSrc) {
+      vAudioSrc = actx.createMediaElementSource(fileVideo);
+      vAudioDest = actx.createMediaStreamDestination();
+      vAudioSrc.connect(vAudioDest); vAudioSrc.connect(actx.destination);
+    }
+    actx.resume();
+    return vAudioDest.stream.getAudioTracks();
+  } catch { return []; }
+}
+
+async function exportVideo() {
+  if (state.kind !== 'video' || state.exporting) return toast('先に動画を選んでください');
+  state.exporting = true;
+  const btn = $('#exportBtn'), bar = $('#progress i');
+  btn.disabled = true; btn.textContent = '書き出し中…';
+  fileVideo.pause(); fileVideo.loop = false;
+  const tracks = videoAudioTracks();
+  fileVideo.currentTime = 0;
+  await new Promise((r) => { fileVideo.addEventListener('seeked', r, { once: true }); setTimeout(r, 800); });
+  const session = startRecorder(tracks);
+  if (!session) { state.exporting = false; btn.disabled = false; btn.textContent = '書き出し'; return; }
+  const onTime = () => { bar.style.width = `${(fileVideo.currentTime / fileVideo.duration) * 100}%`; };
+  fileVideo.addEventListener('timeupdate', onTime);
+  const ended = new Promise((r) => fileVideo.addEventListener('ended', r, { once: true }));
+  await fileVideo.play().catch(() => {});
+  await ended;
+  await new Promise((r) => setTimeout(r, 300)); // 最終フレームを描き切る
+  session.rec.stop();
+  const blob = await session.done;
+  fileVideo.removeEventListener('timeupdate', onTime);
+  bar.style.width = '0';
+  fileVideo.loop = true; fileVideo.currentTime = 0; fileVideo.play().catch(() => {}); syncPlayBtn();
+  state.exporting = false; btn.disabled = false; btn.textContent = '書き出し';
+  showResult(blob);
+}
+
+// ───────── モード切替 ─────────
+const EMPTY = {
+  photo: ['写真を選んで編集をはじめよう', '写真を選ぶ'],
+  camera: ['カメラを起動します', 'カメラを開く'],
+  video: ['動画を選んで加工しよう', '動画を選ぶ'],
+};
+
+function hasEdits() { return undoStack.length > 0 || state.mosaic.any; }
+
+function setMode(m, force = false) {
+  if (m === state.mode && !force) return;
+  if (!force && state.source && state.kind !== 'camera' && hasEdits() && !confirm('編集中の内容は破棄されます。切り替えますか?')) return;
+  if (state.exporting) return toast('書き出し中は切り替えできません');
+  if (camRec) camRec.rec.stop();
+  stopCamera(); fileVideo.pause();
+  const prevKind = state.kind;
+  state.mode = m;
+  $$('#modes button').forEach((b) => b.classList.toggle('on', b.dataset.mode === m));
+  $$('.bar').forEach((b) => b.classList.toggle('on', b.dataset.for === m));
+  if (!force && prevKind !== null) clearSource();
+  if (m === 'camera') startCamera();
+  const [t, b] = EMPTY[m];
+  $('#emptyText').textContent = t; $('#emptyBtn').textContent = b;
+  if (m === 'camera' && !state.source) $('#empty').classList.remove('hide');
+}
+
+// ───────── モザイク操作 ─────────
+function pushUndo(layer) {
+  const src = layer === 'mosaic' ? maskC : drawC;
+  const c = mk(); c.width = src.width; c.height = src.height;
+  c.getContext('2d').drawImage(src, 0, 0);
+  undoStack.push({ layer, c });
+  if (undoStack.length > 12) undoStack.shift();
+}
+function undo() {
+  const e = undoStack.pop();
+  if (!e) return toast('戻す操作がありません');
+  const ctx = e.layer === 'mosaic' ? mctx : dctx;
+  ctx.clearRect(0, 0, state.W, state.H); ctx.drawImage(e.c, 0, 0);
+  state.dirty = true;
+}
+
+function mosaicPaint(ctx, a, b, snap) {
+  const u = state.W / 1000, m = state.mosaic;
+  ctx.save();
+  ctx.globalCompositeOperation = m.mode === 'erase' ? 'destination-out' : 'source-over';
+  ctx.fillStyle = ctx.strokeStyle = '#000';
+  if (m.shape === 'brush') {
+    ctx.lineCap = ctx.lineJoin = 'round'; ctx.lineWidth = m.brush * u;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  } else {
+    ctx.restore(); ctx.save();
+    ctx.clearRect(0, 0, state.W, state.H); ctx.drawImage(snap, 0, 0);
+    ctx.globalCompositeOperation = m.mode === 'erase' ? 'destination-out' : 'source-over';
+    ctx.fillStyle = '#000';
+    ctx.fillRect(Math.min(a.x, b.x), Math.min(a.y, b.y), Math.abs(b.x - a.x), Math.abs(b.y - a.y));
+  }
+  ctx.restore();
+  if (m.mode !== 'erase') state.mosaic.any = true;
+}
+
+// ───────── 書き込み(プリクラ風) ─────────
+function drawGlyph(ctx, type, x, y, size, color) {
+  ctx.save();
+  if (type === 'sparkle') {
+    ctx.fillStyle = SPARKLE_COLORS[(Math.random() * SPARKLE_COLORS.length) | 0];
+    ctx.shadowColor = '#fff'; ctx.shadowBlur = size * 0.6;
+    sparklePath(ctx, x, y, size); ctx.fill();
+  } else {
+    ctx.fillStyle = color; ctx.strokeStyle = '#fff'; ctx.lineWidth = size * 0.12;
+    heartPath(ctx, x, y, size * 1.4); ctx.fill(); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+let pen = { acc: 0, hue: 0 };
+function penSegment(a, b, first) {
+  const { penType, color, size } = state.draw;
+  const u = state.W / 1000, w = size * u, ctx = dctx;
+  if (penType === 'sparkle' || penType === 'heart') {
+    const sp = w * 2.2, gs = penType === 'sparkle' ? w * 1.4 : w * 1.1;
+    if (first) { drawGlyph(ctx, penType, a.x, a.y, gs, color); pen.acc = 0; return; }
+    const d = Math.hypot(b.x - a.x, b.y - a.y);
+    pen.acc += d;
+    while (pen.acc >= sp) {
+      pen.acc -= sp;
+      const t = d ? 1 - pen.acc / d : 1;
+      drawGlyph(ctx, penType, a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, gs, color);
+    }
+    return;
+  }
+  ctx.save();
+  ctx.lineCap = ctx.lineJoin = 'round';
+  const line = (lw) => { ctx.lineWidth = lw; ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x + 0.01, b.y); ctx.stroke(); };
+  if (penType === 'eraser') {
+    ctx.globalCompositeOperation = 'destination-out'; ctx.strokeStyle = '#000'; line(w * 2);
+  } else if (penType === 'neon') {
+    ctx.shadowColor = color; ctx.shadowBlur = w * 2.2; ctx.strokeStyle = color; line(w * 1.3);
+    ctx.shadowBlur = 0; ctx.strokeStyle = '#fff'; line(w * 0.5);
+  } else if (penType === 'rainbow') {
+    pen.hue = (pen.hue + Math.hypot(b.x - a.x, b.y - a.y) * 0.6) % 360;
+    ctx.strokeStyle = `hsl(${pen.hue} 90% 62%)`; line(w);
+  } else {
+    ctx.strokeStyle = color; line(w);
+  }
+  ctx.restore();
+}
+
+function drawText(ctx, text, x, y, px, color, style) {
+  ctx.save();
+  ctx.font = `bold ${px}px ${FONT}`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.lineJoin = 'round';
+  if (style === 'pop') {
+    ctx.lineWidth = px * 0.26; ctx.strokeStyle = '#fff';
+    ctx.shadowColor = 'rgba(0,0,0,.25)'; ctx.shadowBlur = px * 0.12; ctx.shadowOffsetY = px * 0.05;
+    ctx.strokeText(text, x, y);
+    ctx.shadowColor = 'transparent'; ctx.fillStyle = color; ctx.fillText(text, x, y);
+  } else if (style === 'neon') {
+    ctx.shadowColor = color; ctx.shadowBlur = px * 0.5;
+    ctx.lineWidth = px * 0.1; ctx.strokeStyle = color; ctx.strokeText(text, x, y);
+    ctx.shadowBlur = px * 0.25; ctx.fillStyle = '#fff'; ctx.fillText(text, x, y);
+  } else if (style === 'outline') {
+    ctx.lineWidth = px * 0.2; ctx.strokeStyle = '#222'; ctx.strokeText(text, x, y);
+    ctx.fillStyle = color; ctx.fillText(text, x, y);
+  } else {
+    ctx.fillStyle = color; ctx.fillText(text, x, y);
+  }
+  ctx.restore();
+}
+
+function placeStamp(p) {
+  const u = state.W / 1000, px = (state.draw.size * 4 + 30) * u;
+  dctx.save();
+  dctx.font = `${px}px ${FONT}`; dctx.textAlign = 'center'; dctx.textBaseline = 'middle';
+  dctx.shadowColor = 'rgba(0,0,0,.2)'; dctx.shadowBlur = px * 0.08;
+  if (state.draw.stamp === '♡' || state.draw.stamp === '★') dctx.fillStyle = state.draw.color;
+  dctx.fillText(state.draw.stamp, p.x, p.y);
+  dctx.restore();
+}
+
+// ───────── ポインター入力 ─────────
+function needsPointer() { return state.tool === 'mosaic' || state.tool === 'draw'; }
+function pt(e) {
+  const r = out.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * state.W / r.width, y: (e.clientY - r.top) * state.H / r.height };
+}
+let drag = null;
+out.addEventListener('pointerdown', (e) => {
+  if (!state.source || !needsPointer()) return;
+  e.preventDefault(); out.setPointerCapture(e.pointerId);
+  const p = pt(e);
+  if (state.tool === 'mosaic') {
+    pushUndo('mosaic');
+    const snap = mk(); snap.width = state.W; snap.height = state.H; snap.getContext('2d').drawImage(maskC, 0, 0);
+    drag = { type: 'mosaic', start: p, last: p, snap };
+    mosaicPaint(mctx, p, p, snap);
+  } else {
+    const d = state.draw;
+    pushUndo('draw');
+    if (d.tool === 'stamp') { placeStamp(p); drag = null; }
+    else if (d.tool === 'text') {
+      const u = state.W / 1000, text = $('#textInput').value.trim();
+      if (text) drawText(dctx, text, p.x, p.y, (d.size * 3 + 28) * u, d.color, d.textStyle);
+      drag = null;
+    } else {
+      pen = { acc: 0, hue: Math.random() * 360 };
+      state.draw.penType = d.tool === 'eraser' ? 'eraser' : state.draw.penType;
+      drag = { type: 'pen', last: p };
+      penSegment(p, p, true);
+    }
+  }
+  state.dirty = true;
+});
+out.addEventListener('pointermove', (e) => {
+  if (!drag) return;
+  const p = pt(e);
+  if (drag.type === 'mosaic') mosaicPaint(mctx, state.mosaic.shape === 'rect' ? drag.start : drag.last, p, drag.snap);
+  else penSegment(drag.last, p, false);
+  drag.last = p; state.dirty = true;
+});
+const endDrag = () => { drag = null; };
+out.addEventListener('pointerup', endDrag);
+out.addEventListener('pointercancel', endDrag);
+
+// ───────── UI 組み立て ─────────
+function setTool(t) {
+  state.tool = t;
+  $$('#tools button').forEach((b) => b.classList.toggle('on', b.dataset.tool === t));
+  $$('.pane').forEach((p) => p.classList.toggle('on', p.id === `pane-${t}`));
+  out.style.touchAction = needsPointer() ? 'none' : 'auto';
+  out.style.cursor = needsPointer() ? 'crosshair' : 'default';
+}
+
+function seg(id, key, obj, after) {
+  $$(`#${id} button`).forEach((b) => b.addEventListener('click', () => {
+    obj[key] = b.dataset.v;
+    $$(`#${id} button`).forEach((x) => x.classList.toggle('on', x === b));
+    after?.();
+  }));
+}
+
+function chips(el, items, get, set) {
+  items.forEach((it) => {
+    const b = document.createElement('button');
+    b.textContent = it.label;
+    b.addEventListener('click', () => { set(it); $$('button', el).forEach((x) => x.classList.toggle('on', x === b)); state.dirty = true; });
+    if (get(it)) b.classList.add('on');
+    el.appendChild(b);
+  });
+}
+
+function buildUI() {
+  // モード
+  $$('#modes button').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
+  $$('#tools button').forEach((b) => b.addEventListener('click', () => setTool(b.dataset.tool)));
+
+  // 加工
+  chips($('#filterChips'), FILTERS.map((f) => ({ f, label: f.name })), (i) => i.f === state.filter, (i) => { state.filter = i.f; });
+  for (const [id, key] of [['adjBrightness', 'brightness'], ['adjContrast', 'contrast'], ['adjSaturation', 'saturation']]) {
+    $(`#${id}`).addEventListener('input', (e) => { state.adj[key] = e.target.value / 100; state.dirty = true; });
+  }
+
+  // テンプレート
+  TEMPLATES.forEach((t) => {
+    const b = document.createElement('button');
+    const c = mk(); c.width = 128; c.height = 160;
+    drawTemplateThumb(c, t);
+    b.append(c, t.name);
+    if (t === state.template) b.classList.add('on');
+    b.addEventListener('click', () => { state.template = t; $$('#templateGrid button').forEach((x) => x.classList.toggle('on', x === b)); state.dirty = true; });
+    $('#templateGrid').appendChild(b);
+  });
+
+  // モザイク
+  seg('mosaicShape', 'shape', state.mosaic);
+  seg('mosaicStyle', 'style', state.mosaic, () => { state.dirty = true; });
+  seg('mosaicMode', 'mode', state.mosaic);
+  $('#mosaicBlock').addEventListener('input', (e) => { state.mosaic.block = +e.target.value; state.dirty = true; });
+  $('#mosaicBrush').addEventListener('input', (e) => { state.mosaic.brush = +e.target.value; });
+  $('#mosaicAll').addEventListener('click', () => {
+    if (!state.source) return;
+    pushUndo('mosaic'); mctx.globalCompositeOperation = 'source-over'; mctx.fillStyle = '#000'; mctx.fillRect(0, 0, state.W, state.H);
+    state.mosaic.any = true; state.dirty = true;
+  });
+  $('#mosaicClear').addEventListener('click', () => {
+    if (!state.source) return;
+    pushUndo('mosaic'); mctx.clearRect(0, 0, state.W, state.H); state.mosaic.any = false; state.dirty = true;
+  });
+
+  // 書き込み
+  const showSub = () => {
+    const t = state.draw.tool;
+    $$('#pane-draw .sub').forEach((s) => { s.style.display = s.dataset.for === t ? '' : 'none'; });
+    $('#colors').style.display = t === 'eraser' ? 'none' : '';
+  };
+  seg('drawTool', 'tool', state.draw, () => { if (state.draw.tool !== 'eraser' && state.draw.penType === 'eraser') state.draw.penType = 'normal'; showSub(); });
+  chips($('#penTypes'), [
+    { v: 'normal', label: 'ふつう' }, { v: 'neon', label: 'ネオン' }, { v: 'rainbow', label: 'レインボー' },
+    { v: 'sparkle', label: 'キラキラ' }, { v: 'heart', label: 'ハート' },
+  ], (i) => i.v === state.draw.penType, (i) => { state.draw.penType = i.v; });
+  chips($('#stamps'), ['♡', '★', '✿', '♪', '✨', '🎀', '🌸', '💖', '👑', '☁️', '🍓', '🦋'].map((s) => ({ s, label: s })),
+    (i) => i.s === state.draw.stamp, (i) => { state.draw.stamp = i.s; });
+  chips($('#textStyles'), [
+    { v: 'pop', label: 'ポップ' }, { v: 'neon', label: 'ネオン' }, { v: 'outline', label: 'ふちどり' }, { v: 'plain', label: 'シンプル' },
+  ], (i) => i.v === state.draw.textStyle, (i) => { state.draw.textStyle = i.v; });
+  COLORS.forEach((c, i) => {
+    const b = document.createElement('button');
+    b.style.background = c; if (i === 0) b.classList.add('on');
+    b.addEventListener('click', () => { state.draw.color = c; $$('#colors button').forEach((x) => x.classList.toggle('on', x === b)); });
+    $('#colors').appendChild(b);
+  });
+  $('#penSize').addEventListener('input', (e) => { state.draw.size = +e.target.value; });
+  $('#drawUndo').addEventListener('click', undo);
+  $('#drawClear').addEventListener('click', () => {
+    if (!state.source) return;
+    pushUndo('draw'); dctx.clearRect(0, 0, state.W, state.H); state.dirty = true;
+  });
+  showSub();
+
+  // 写真
+  $('#openPhoto').addEventListener('click', () => $('#photoInput').click());
+  $('#photoInput').addEventListener('change', (e) => { loadPhoto(e.target.files[0]); e.target.value = ''; });
+  $('#savePhoto').addEventListener('click', savePhoto);
+
+  // カメラ
+  $('#flipCam').addEventListener('click', () => { state.facing = state.facing === 'user' ? 'environment' : 'user'; startCamera(); });
+  $('#shutter').addEventListener('click', shutter);
+  $('#recBtn').addEventListener('click', toggleCamRec);
+
+  // 動画
+  $('#openVideo').addEventListener('click', () => $('#videoInput').click());
+  $('#videoInput').addEventListener('change', (e) => { loadVideo(e.target.files[0]); e.target.value = ''; });
+  $('#playBtn').addEventListener('click', () => { if (fileVideo.paused) fileVideo.play(); else fileVideo.pause(); syncPlayBtn(); state.dirty = true; });
+  $('#muteBtn').addEventListener('click', () => { fileVideo.muted = !fileVideo.muted; $('#muteBtn').textContent = fileVideo.muted ? '🔇' : '🔊'; });
+  $('#exportBtn').addEventListener('click', exportVideo);
+
+  // 空状態ボタン
+  $('#emptyBtn').addEventListener('click', () => {
+    if (state.mode === 'photo') $('#photoInput').click();
+    else if (state.mode === 'video') $('#videoInput').click();
+    else startCamera();
+  });
+
+  // 結果ダイアログ
+  $('#resultSave').addEventListener('click', () => saveBlob(resultBlob, resultName));
+  $('#resultClose').addEventListener('click', closeResult);
+}
+
+buildUI();
+setMode('photo', true);
+setTool('filter');
+loop();
+
+// テスト用フック
+window.__shinpoko = { state, render, loadPhoto, setMode, setTool, undoStack };
