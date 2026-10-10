@@ -1,6 +1,8 @@
 import { FILTERS, applyAdjust } from './filters.js';
 import { TEMPLATES, drawTemplateThumb, heartPath, sparklePath } from './templates.js';
 import { POST_EFFECTS, PostFx } from './post.js';
+import { AR_EFFECTS, drawAR, faceMetrics } from './ar.js';
+import { loadFace, detectFaces, resetFaceSmoothing, faceState } from './face.js';
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -25,6 +27,7 @@ const state = {
   W: 0, H: 0, kind: null, source: null, mirror: false, facing: 'user',
   filter: FILTERS[0], adj: { brightness: 0, contrast: 0, saturation: 0, warmth: 0, sharpness: 0, vignette: 0 },
   effect: POST_EFFECTS[0], effectAmt: 1,
+  ar: AR_EFFECTS[0], beauty: { slim: 0, eyes: 0 }, faces: [], srcId: 0, facesFor: -1,
   template: TEMPLATES[0],
   mosaic: { shape: 'brush', style: 'pixel', mode: 'paint', block: 20, brush: 50, any: false },
   draw: { tool: 'pen', penType: 'normal', stamp: '♡', textStyle: 'pop', color: COLORS[0], size: 14 },
@@ -67,6 +70,7 @@ function setSize(w, h, keepLayers) {
 
 function setSource(kind, source, w, h, keepLayers = false) {
   state.kind = kind; state.source = source;
+  state.srcId++; state.faces = []; resetFaceSmoothing();
   setSize(w, h, keepLayers);
   $('#empty').classList.add('hide'); out.classList.add('show');
   if (kind === 'image') drawSource();
@@ -105,12 +109,14 @@ function render() {
   const { W, H } = state;
   if (state.kind !== 'image') drawSource();
   ensureGL();
+  updateFaces();
   let base = srcC;
   const t = performance.now() / 1000;
   if (glc) {
     tex.loadContentsOf(srcC);
     glc.draw(tex);
     state.filter.apply(glc, W, H);
+    applyBeauty(glc, W, H);
     applyAdjust(glc, state.adj, W, H);
     glc.update();
     base = glc;
@@ -118,8 +124,46 @@ function render() {
   if (post && state.effect.mode) base = post.render(base, W, H, state.effect.mode, t, state.effectAmt);
   octx.drawImage(base, 0, 0, W, H);
   if (state.mosaic.any) applyMosaic();
+  if (state.ar.draw && state.faces.length) drawAR(octx, state.ar, state.faces, W, H, t);
   octx.drawImage(drawC, 0, 0);
   state.template.draw(octx, W, H, t);
+}
+
+// ───────── 顔認識(AR・美容補正) ─────────
+let faceFrame = 0, faceAsked = false;
+const wantFaces = () => state.ar.id !== 'none' || state.beauty.slim > 0 || state.beauty.eyes > 0;
+
+function updateFaces() {
+  if (!wantFaces()) { state.faces = []; return; }
+  if (!faceState.ready) {
+    if (!faceAsked) {
+      faceAsked = true;
+      toast('顔認識を準備中…(初回のみ数秒かかります)', 4000);
+      loadFace().then(() => {
+        if (faceState.failed) toast('顔認識を読み込めませんでした', 4000);
+        state.facesFor = -1; state.dirty = true;
+      });
+    }
+    return;
+  }
+  if (state.kind === 'image') {
+    if (state.facesFor !== state.srcId) {
+      state.faces = detectFaces(srcC, false); state.facesFor = state.srcId;
+      if (!state.faces.length) toast('顔が見つかりませんでした', 3000);
+    }
+  } else if ((faceFrame++ & 1) === 0) {
+    state.faces = detectFaces(srcC, true);
+  }
+}
+
+function applyBeauty(c, W, H) {
+  const { slim, eyes } = state.beauty;
+  if (!state.faces.length || (!slim && !eyes)) return;
+  for (const lm of state.faces) {
+    const g = faceMetrics(lm, W, H);
+    if (eyes) for (const e of [g.eyeL, g.eyeR]) c.bulgePinch(e.x, e.y, g.fw * 0.16, eyes * 0.5);
+    if (slim) { const p = g.at(0, -0.22); c.bulgePinch(p.x, p.y, g.fw * 0.62, -slim * 0.4); }
+  }
 }
 
 function applyMosaic() {
@@ -141,7 +185,7 @@ function applyMosaic() {
 
 const STATIC_FX = new Set(['none', 'rgb', 'mirror', 'duo', 'bloom']);
 function isLive() {
-  if (state.template.animated || !STATIC_FX.has(state.effect.id)) return true;
+  if (state.template.animated || !STATIC_FX.has(state.effect.id) || state.ar.draw) return true;
   if (state.kind === 'camera') return camVideo.readyState >= 2;
   if (state.kind === 'video') return !fileVideo.paused && !fileVideo.ended;
   return false;
@@ -609,6 +653,18 @@ function buildUI() {
   thumbList($('#filterChips'), 'filter', FILTERS, (f) => f === state.filter, (f) => { state.filter = f; });
   thumbList($('#effectChips'), 'effect', POST_EFFECTS, (f) => f === state.effect, (f) => { state.effect = f; });
   thumbList($('#templateGrid'), 'template', TEMPLATES, (t) => t === state.template, (t) => { state.template = t; }, (cv, t) => drawTemplateThumb(cv, t));
+  AR_EFFECTS.forEach((it) => {
+    const b = document.createElement('button'), d = document.createElement('div');
+    d.className = 'emoji'; d.textContent = it.icon;
+    b.append(d, it.name);
+    if (it === state.ar) b.classList.add('on');
+    b.addEventListener('click', () => {
+      state.ar = it; $$('#arChips button').forEach((x) => x.classList.toggle('on', x === b)); state.dirty = true;
+    });
+    $('#arChips').appendChild(b);
+  });
+  $('#beautySlim').addEventListener('input', (e) => { state.beauty.slim = e.target.value / 100; state.dirty = true; });
+  $('#beautyEyes').addEventListener('input', (e) => { state.beauty.eyes = e.target.value / 100; state.dirty = true; });
   $('#effectAmt').addEventListener('input', (e) => { state.effectAmt = e.target.value / 100; state.dirty = true; });
 
   // 調整

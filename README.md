@@ -7,6 +7,7 @@
 | 機能 | 内容 |
 |---|---|
 | フィルター | 26種類(ナチュラル/ふんわり/ゆめかわ/透明感/ミルキー/エモ/シネマティック/シティポップ/ヴィンテージ/ドット/ピクセル/ジオラマ/ぷっくり/きゅっ …)。実際の写真に当てたサムネイルで選べる |
+| 顔AR | 顔に追従する猫(線画/もふ)・いぬ・うさぎ・くま・ほっぺ・目キラ・王冠・天使の輪・ハートめがね(最大3人)+ 小顔・目を大きく。写真/カメラ/動画すべてで使えます |
 | エフェクト | SNS で流行りの動くエフェクト: グリッチ/RGBずらし/VHS/平成レトロ/キラふわ/万華鏡/ミラー/ブラウン管/ライトリーク/ビートズーム/シェイク/デュオトーン(強さ調整つき。独自の WebGL シェーダー) |
 | 調整 | 明るさ/コントラスト/あざやかさ/暖かさ/シャープ/ビネット |
 | モザイク | なぞる/四角で囲む、モザイク/ぼかし、粗さ・ブラシ太さ調整、消しゴム、全体がけ |
@@ -51,9 +52,13 @@ js/app.js         読み込み・描画パイプライン・モザイク・書�
 js/filters.js     加工フィルター定義(glfx.js の組み合わせ)
 js/templates.js   フレーム/動くオーバーレイ(Canvas で描画)
 js/post.js        動くエフェクト(WebGL フラグメントシェーダー)
+js/face.js        顔のランドマーク検出(MediaPipe、初回のみ読み込み)
+js/ar.js          顔ARの描画(猫・犬・うさぎ …)
 vendor/glfx.js    WebGL 画像エフェクト (MIT)
+vendor/mediapipe/ MediaPipe Tasks Vision + Face Landmarker モデル (Apache-2.0, 約29MB)
 ```
 
 ## クレジット
 
 - [glfx.js](https://github.com/evanw/glfx.js) © 2011 Evan Wallace — MIT License(`vendor/glfx.LICENSE`)。加工エフェクト(ビネット、ハーフトーン、ピクセル化、膨らみ、ズームブラー、ティルトシフト等)に使用。
+- [MediaPipe Tasks Vision](https://github.com/google-ai-edge/mediapipe) / Face Landmarker モデル © Google — Apache License 2.0。顔のランドマーク検出に使用(`vendor/mediapipe/`)。顔認識はすべて端末内で実行され、画像は送信されません。
